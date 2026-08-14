@@ -81,6 +81,11 @@ const CONFIG = {
   // CONFIRMED: within each card, this is the link to the company's info.
   detailLinkSelector: 'div.flex.gap-2.mt-3 a',
 
+  // CONFIRMED: the category label shown on each card (relative to the
+  // card root, not the page root — so it works no matter which grid
+  // position a given card happens to occupy).
+  categorySelector: 'div.p-5.flex.flex-col.items-center.pt-10 > p',
+
   // Icon-based field detection on the detail view (confirmed from live markup).
   fieldIconSelectors: {
     website: 'svg.lucide-globe',
@@ -113,9 +118,9 @@ function clean(t) {
 
 // Read each card's name + the href of its detail link (if any), without
 // holding onto ElementHandles (the DOM may re-render between steps).
-async function getCardSummaries(page, cardSelector, nameSelectors, detailLinkSelector) {
+async function getCardSummaries(page, cardSelector, nameSelectors, detailLinkSelector, categorySelector) {
   return page.evaluate(
-    (cardSelector, nameSelectors, detailLinkSelector) => {
+    (cardSelector, nameSelectors, detailLinkSelector, categorySelector) => {
       function cleanText(t) {
         return (t || '').replace(/\s+/g, ' ').trim();
       }
@@ -131,12 +136,15 @@ async function getCardSummaries(page, cardSelector, nameSelectors, detailLinkSel
         }
         const link = card.querySelector(detailLinkSelector);
         const href = link ? link.getAttribute('href') : null;
-        return { index, name, href };
+        const categoryEl = card.querySelector(categorySelector);
+        const category = categoryEl ? cleanText(categoryEl.textContent) : '';
+        return { index, name, href, category };
       });
     },
     cardSelector,
     nameSelectors,
-    detailLinkSelector
+    detailLinkSelector,
+    categorySelector
   );
 }
 
@@ -327,11 +335,12 @@ async function main() {
       page,
       CONFIG.cardSelector,
       CONFIG.nameSelectors,
-      CONFIG.detailLinkSelector
+      CONFIG.detailLinkSelector,
+      CONFIG.categorySelector
     );
     console.log(`  Found ${cardSummaries.length} company cards on page ${pageNum}`);
 
-    for (const { index, name, href } of cardSummaries) {
+    for (const { index, name, href, category } of cardSummaries) {
       const label = name || `card #${index + 1}`;
       console.log(`  → (${index + 1}/${cardSummaries.length}) ${label}`);
 
@@ -343,6 +352,7 @@ async function main() {
         email: detailData?.email || '',
         phone: detailData?.phone || '',
         country: detailData?.country || '',
+        category: category || '',
       });
 
       await randomDelay(CONFIG.minDelayMs, CONFIG.maxDelayMs);
@@ -392,11 +402,12 @@ async function main() {
 // stays locked.
 async function writeCsvWithRetry(records, preferredPath, maxAttempts = 4) {
   const header = [
-    { id: 'name', title: 'name' },
+    { id: 'name', title: 'company' },
     { id: 'website', title: 'website' },
     { id: 'email', title: 'email' },
     { id: 'phone', title: 'phone' },
     { id: 'country', title: 'country' },
+    { id: 'category', title: 'category' },
   ];
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
