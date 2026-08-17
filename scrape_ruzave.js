@@ -41,7 +41,18 @@
  *     to clicking it in place and reading a modal from the same tab).
  *
  * Results are POSTed as JSON to a Google Apps Script web app (see
- * CONFIG.webhookUrl) instead of being written to a local CSV.
+ * CONFIG.webhookUrl). Every record is also written in real time to a
+ * local JSON file AND a local CSV file (see CONFIG.jsonOutputFile /
+ * CONFIG.csvOutputFile) as soon as it's scraped, so nothing scraped is
+ * lost even if the webhook is down or the run gets interrupted partway
+ * through — two independent backup formats on disk, not just one.
+ *
+ * PERFORMANCE: detail pages are scraped CONFIG.concurrency at a time
+ * (separate background tabs), image/font/stylesheet requests are
+ * blocked on those tabs since only the DOM/icons matter, and navigation
+ * uses 'domcontentloaded' + a short explicit wait for the icons rather
+ * than waiting for full network-idle. Tune CONFIG.concurrency up/down
+ * based on how the site holds up.
  *
  * Install dependencies first:
  *   npm init -y
@@ -53,6 +64,7 @@
 
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const fs = require('fs');
 
 puppeteer.use(StealthPlugin());
 
@@ -81,18 +93,42 @@ const CONFIG = {
   // even if a later section fails or the run is interrupted.
   sendPerSection: true,
 
+  // Local live backup: every record is written here as soon as it's
+  // scraped (in addition to being sent to the webhook), so nothing is
+  // lost even if the webhook is down, the script crashes, or you need
+  // to stop it partway through a 70-page run. Both files are updated
+  // together (JSON + CSV) so you have two independent copies on disk.
+  jsonOutputFile: 'ruzave-live.json',
+  csvOutputFile: 'ruzave-live.csv',
+
+  // How many detail pages to scrape IN PARALLEL (each gets its own
+  // background tab). This is the single biggest speed lever — going from
+  // sequential (1) to e.g. 6 can cut total runtime by roughly that factor.
+  // Only applies to cards with a real detail link; cards needing the
+  // in-page-click fallback are still handled one at a time (see below).
+  // Raise this if the site handles it fine; lower it if you start seeing
+  // more failures/timeouts (a sign of rate-limiting).
+  concurrency: 6,
+
   // Delay between opening each company's detail tab (ms) — randomized to
   // look more human and reduce chances of being rate-limited / blocked.
-  minDelayMs: 1200,
-  maxDelayMs: 2800,
+  // Kept short since concurrency + the per-tab timeouts below already
+  // cap how much load hits the site at once.
+  minDelayMs: 300,
+  maxDelayMs: 900,
 
   // Longer delay specifically between paginating to a new list page.
-  minPageDelayMs: 2500,
-  maxPageDelayMs: 5000,
+  minPageDelayMs: 1500,
+  maxPageDelayMs: 3000,
 
   // How long to wait for cards / detail content to appear before giving up.
+  // Kept fairly tight: a page that hasn't shown its icons within a few
+  // seconds essentially never does, and every second here is multiplied
+  // by however many companies end up failing, which adds up fast on a
+  // multi-thousand-company run.
   cardWaitTimeoutMs: 15000,
-  detailWaitTimeoutMs: 10000,
+  detailNavTimeoutMs: 12000,
+  detailWaitTimeoutMs: 5000,
 
   // CONFIRMED: direct children of the card grid are the company cards.
   // The site renders slightly different grid classes depending on screen
@@ -221,21 +257,66 @@ async function waitForDetailContent(targetPage, fieldIconSelectors, timeout) {
   await targetPage.waitForSelector(combinedSelector, { timeout });
 }
 
+function hasRealLink(href) {
+  return Boolean(href && href.trim() && href.trim() !== '#' && !href.trim().toLowerCase().startsWith('javascript:'));
+}
+
+// Blocks image/font/media/stylesheet requests on a page. The scraper only
+// needs the DOM (specifically a handful of SVG icons + adjacent text), so
+// none of these are needed — skipping them cuts real page-load time
+// substantially, especially on pages with lots of photos/logos.
+async function blockHeavyResources(targetPage) {
+  await targetPage.setRequestInterception(true);
+  targetPage.on('request', (req) => {
+    const type = req.resourceType();
+    if (type === 'image' || type === 'font' || type === 'media' || type === 'stylesheet') {
+      req.abort();
+    } else {
+      req.continue();
+    }
+  });
+}
+
+// Simple concurrency-limited queue runner — no external deps. Pulls items
+// off a shared cursor so N workers stay busy until the list is drained,
+// rather than processing everything strictly one at a time.
+async function runWithConcurrency(items, limit, worker) {
+  let cursor = 0;
+  async function runNext() {
+    while (cursor < items.length) {
+      const i = cursor;
+      cursor += 1;
+      await worker(items[i], i);
+    }
+  }
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: workerCount }, () => runNext()));
+}
+
 // Scrape one company's detail info. Prefers opening the link in a fresh
-// background tab (doesn't disturb the list page / pagination at all). If
-// there's no usable href, falls back to clicking the link in place and
-// reading the resulting modal from the same tab.
+// background tab (doesn't disturb the list page / pagination at all, and
+// is safe to run concurrently with other calls since each gets its own
+// tab). If there's no usable href, falls back to clicking the link in
+// place and reading the resulting modal from the same tab — this path is
+// NOT concurrency-safe since it shares the single main `page`, so callers
+// must run fallback cards one at a time.
 async function scrapeCompanyDetail(browser, page, cardIndex, href, config) {
-  const isRealLink =
-    href && href.trim() && href.trim() !== '#' && !href.trim().toLowerCase().startsWith('javascript:');
+  const isRealLink = hasRealLink(href);
 
   if (isRealLink) {
     const absoluteUrl = new URL(href, page.url()).toString();
     const detailPage = await browser.newPage();
     try {
-      await detailPage.goto(absoluteUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+      await blockHeavyResources(detailPage);
+      await detailPage.goto(absoluteUrl, { waitUntil: 'domcontentloaded', timeout: config.detailNavTimeoutMs });
       await waitForDetailContent(detailPage, config.fieldIconSelectors, config.detailWaitTimeoutMs);
-      await randomDelay(300, 700); // let content settle
+      // The icon (e.g. svg.lucide-mail) can render before the actual
+      // email/phone text does — those often arrive via a slightly later
+      // fetch. Wait for in-flight requests to quiet down (short timeout,
+      // non-fatal) on top of a longer settle pause, so we don't extract
+      // before that data has actually landed in the DOM.
+      await detailPage.waitForNetworkIdle({ idleTime: 500, timeout: 4000 }).catch(() => {});
+      await randomDelay(500, 900); // let content settle
       const data = await scrapeDetailFields(detailPage, config.fieldIconSelectors);
       return data;
     } catch (e) {
@@ -260,7 +341,8 @@ async function scrapeCompanyDetail(browser, page, cardIndex, href, config) {
       cardIndex
     );
     await waitForDetailContent(page, config.fieldIconSelectors, config.detailWaitTimeoutMs);
-    await randomDelay(300, 700);
+    await page.waitForNetworkIdle({ idleTime: 500, timeout: 4000 }).catch(() => {});
+    await randomDelay(500, 900);
     const data = await scrapeDetailFields(page, config.fieldIconSelectors);
 
     // Close whatever opened (Radix Dialog-style modals close on Escape).
@@ -377,18 +459,19 @@ async function main() {
       );
       console.log(`  Found ${cardSummaries.length} company cards on page ${pageNum}`);
 
-      for (const { index, name, href, category } of cardSummaries) {
-        const label = name || `card #${index + 1}`;
-        console.log(`  → (${index + 1}/${cardSummaries.length}) ${label}`);
+      // Cards with a real detail link can be scraped concurrently (each
+      // gets its own background tab). Cards without one need the
+      // in-page-click fallback, which shares the single main `page` and
+      // so must run one at a time — but those are rare, so this barely
+      // affects overall speed.
+      const linkedCards = cardSummaries.filter((c) => hasRealLink(c.href));
+      const fallbackCards = cardSummaries.filter((c) => !hasRealLink(c.href));
 
-        const detailData = await scrapeCompanyDetail(browser, page, index, href, CONFIG);
-
+      const handleScraped = ({ name, category }, detailData) => {
         if (!detailData) {
           skippedCount += 1;
-          await randomDelay(CONFIG.minDelayMs, CONFIG.maxDelayMs);
-          continue;
+          return;
         }
-
         const record = {
           section: section.label,
           name,
@@ -398,7 +481,6 @@ async function main() {
           country: detailData?.country || '',
           category: category || '',
         };
-
         // Dedupe by email: same company can legitimately show up under
         // more than one section (e.g. both "maritime" and "ocean-logistics").
         // Rows with no email can't be deduped this way, so those are
@@ -410,8 +492,24 @@ async function main() {
           if (emailKey) seenEmails.add(emailKey);
           sectionResults.push(record);
           allResults.push(record);
+          saveJsonSnapshot(allResults, CONFIG.jsonOutputFile); // write-through after every new record
+          saveCsvSnapshot(allResults, CONFIG.csvOutputFile); // same, as a second independent backup format
         }
+      };
 
+      await runWithConcurrency(linkedCards, CONFIG.concurrency, async ({ index, name, href, category }) => {
+        const label = name || `card #${index + 1}`;
+        console.log(`  → (${index + 1}/${cardSummaries.length}) ${label}`);
+        const detailData = await scrapeCompanyDetail(browser, page, index, href, CONFIG);
+        handleScraped({ name, category }, detailData);
+        await randomDelay(CONFIG.minDelayMs, CONFIG.maxDelayMs);
+      });
+
+      for (const { index, name, href, category } of fallbackCards) {
+        const label = name || `card #${index + 1}`;
+        console.log(`  → (${index + 1}/${cardSummaries.length}) ${label} [fallback]`);
+        const detailData = await scrapeCompanyDetail(browser, page, index, href, CONFIG);
+        handleScraped({ name, category }, detailData);
         await randomDelay(CONFIG.minDelayMs, CONFIG.maxDelayMs);
       }
 
@@ -470,21 +568,90 @@ async function main() {
   }
 }
 
+// Writes the full in-memory results array to a local JSON file, atomically
+// (write to a temp file, then rename over the real one). Called after every
+// single new record, so ruzave-live.json is always current — if the script
+// crashes, gets killed, or the webhook is unreachable, everything scraped
+// so far is still safely on disk in valid JSON, not just in memory.
+function saveJsonSnapshot(records, filePath) {
+  try {
+    const tmpPath = `${filePath}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(records, null, 2));
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    console.log(`  ⚠ Couldn't write live JSON backup (${err.message}).`);
+  }
+}
+
+const CSV_COLUMNS = ['section', 'name', 'website', 'email', 'phone', 'country', 'category'];
+
+// Quotes a CSV field if it contains a comma, quote, or newline, escaping
+// any internal quotes by doubling them (standard CSV escaping).
+function toCsvField(value) {
+  const str = value == null ? '' : String(value);
+  if (/[",\n\r]/.test(str)) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+// Same fail-safe as saveJsonSnapshot, but as a plain CSV — a second,
+// independent local backup (no extra dependency: written by hand rather
+// than via csv-writer). Two different formats on disk means one being
+// malformed, locked, or hard to open doesn't leave you without any
+// usable copy of the data.
+function saveCsvSnapshot(records, filePath) {
+  try {
+    const lines = [CSV_COLUMNS.join(',')];
+    for (const record of records) {
+      lines.push(CSV_COLUMNS.map((col) => toCsvField(record[col])).join(','));
+    }
+    const tmpPath = `${filePath}.tmp`;
+    fs.writeFileSync(tmpPath, lines.join('\n') + '\n');
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    console.log(`  ⚠ Couldn't write live CSV backup (${err.message}).`);
+  }
+}
+
 // POSTs a batch of records as JSON to the Google Apps Script web app.
 // Apps Script web apps can occasionally return a transient error (cold
 // start, temporary quota hiccup), so this retries a few times with a
 // short pause before giving up on that batch.
+// POSTs a batch of records as JSON to the Google Apps Script web app.
+// Apps Script /exec URLs execute the request, then respond with a 302
+// redirect to a script.googleusercontent.com URL to actually deliver the
+// output. Per the fetch spec, a POST that hits a 301/302 redirect is
+// automatically re-sent as a GET with no body — so blindly following it
+// (redirect: 'follow') turns into an unauthenticated GET against Google,
+// which comes back as 401. The actual doPost() already ran on the
+// original POST by that point; we just need to fetch the response body
+// without letting fetch silently downgrade the method. So: send with
+// redirect: 'manual', and if we get a 3xx back, follow the Location
+// ourselves with a plain GET (safe here — that second hop is only
+// fetching the already-computed output, not re-executing anything).
 async function sendToWebhookWithRetry(records, webhookUrl, maxAttempts = 4) {
   const payload = JSON.stringify({ records });
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      const response = await fetch(webhookUrl, {
+      let response = await fetch(webhookUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: payload,
-        redirect: 'follow', // Apps Script /exec URLs typically 302 to a real endpoint
+        redirect: 'manual',
       });
+
+      // Opaque redirect (type 'opaqueredirect') happens in some fetch
+      // implementations under redirect: 'manual' — status won't be
+      // readable, but Location usually still is via response.headers.
+      const location = response.headers.get('location');
+      if ((response.status >= 300 && response.status < 400) || response.type === 'opaqueredirect') {
+        if (!location) {
+          throw new Error(`Got a redirect (status ${response.status}) but no Location header to follow`);
+        }
+        response = await fetch(location, { method: 'GET' });
+      }
 
       if (!response.ok) {
         throw new Error(`HTTP ${response.status} ${response.statusText}`);
@@ -500,6 +667,10 @@ async function sendToWebhookWithRetry(records, webhookUrl, maxAttempts = 4) {
         continue;
       }
       console.error(`❌ Could not send ${records.length} records to the webhook after ${maxAttempts} attempts.`);
+      console.error(
+        '  If this keeps happening, double-check your Apps Script deployment is set to ' +
+          '"Execute as: Me" and "Who has access: Anyone" (Deploy → Manage deployments → Edit).'
+      );
       console.error('These records were not delivered. Dumping them to the console so they are not lost:');
       console.error(JSON.stringify(records, null, 2));
     }
