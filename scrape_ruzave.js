@@ -86,12 +86,18 @@ const CONFIG = {
   // Combined output — one row per company, across all sections above.
   // Sent as JSON to this Google Apps Script web app instead of a CSV file.
   webhookUrl:
-    'https://script.google.com/macros/s/AKfycbzGs54MM9Nyx-lx05wMnxkStRKyo6OcIgFE4d413eRKGJVt79tbONQ40yzb0blO6QGd/exec',
+    'https://script.google.com/macros/s/AKfycbzE1GYtD-Wxs8wH8Jb1KIXqTpldCFqyqCvO-1tuABdRg3D30N2qBoud3sJUwDrIkaY2/exec',
 
-  // Sent one section at a time as it finishes (rather than one giant
-  // request at the end), so partial results still make it to the sheet
-  // even if a later section fails or the run is interrupted.
-  sendPerSection: true,
+  // Shared secret expected by the Apps Script web app, sent as the
+  // top-level "secret" field on every POST body.
+  webhookSecret: 'scrapemaster',
+
+  // The whole run's records are sent as ONE batched POST after every
+  // section has finished scraping (see the end of main() below), not
+  // per-section and not one row at a time. Kept as a toggle in case you
+  // ever want partial-progress sends back — set true to also POST after
+  // each section completes (in addition to the final combined send).
+  sendPerSection: false,
 
   // Local live backup: every record is written here as soon as it's
   // scraped (in addition to being sent to the webhook), so nothing is
@@ -548,18 +554,18 @@ async function main() {
 
     if (CONFIG.sendPerSection && sectionResults.length > 0) {
       console.log(`  📤 Sending ${sectionResults.length} "${section.label}" records to Google Sheet...`);
-      await sendToWebhookWithRetry(sectionResults, CONFIG.webhookUrl);
+      await sendToWebhookWithRetry(sectionResults, CONFIG.webhookUrl, CONFIG.webhookSecret);
     }
   }
 
   await browser.close();
 
-  if (!CONFIG.sendPerSection) {
-    console.log(`\n📤 Sending all ${allResults.length} records to Google Sheet...`);
-    await sendToWebhookWithRetry(allResults, CONFIG.webhookUrl);
-  } else {
-    console.log(`\n✅ All sections sent. ${allResults.length} total records.`);
-  }
+  // Single batched POST for the whole run: every row scraped across every
+  // section, sent as one request rather than one row (or one section) at
+  // a time. If CONFIG.sendPerSection is also on, this is an additional
+  // final send of everything combined.
+  console.log(`\n📤 Sending all ${allResults.length} records to Google Sheet...`);
+  await sendToWebhookWithRetry(allResults, CONFIG.webhookUrl, CONFIG.webhookSecret);
   if (duplicateCount > 0) {
     console.log(`  (Skipped ${duplicateCount} duplicate record${duplicateCount === 1 ? '' : 's'} with an email already seen elsewhere.)`);
   }
@@ -614,11 +620,8 @@ function saveCsvSnapshot(records, filePath) {
   }
 }
 
-// POSTs a batch of records as JSON to the Google Apps Script web app.
-// Apps Script web apps can occasionally return a transient error (cold
-// start, temporary quota hiccup), so this retries a few times with a
-// short pause before giving up on that batch.
-// POSTs a batch of records as JSON to the Google Apps Script web app.
+// POSTs one batch of records as JSON to the Google Apps Script web app, in
+// the shape { secret, rows: [...] } with Content-Type: application/json.
 // Apps Script /exec URLs execute the request, then respond with a 302
 // redirect to a script.googleusercontent.com URL to actually deliver the
 // output. Per the fetch spec, a POST that hits a 301/302 redirect is
@@ -630,8 +633,16 @@ function saveCsvSnapshot(records, filePath) {
 // redirect: 'manual', and if we get a 3xx back, follow the Location
 // ourselves with a plain GET (safe here — that second hop is only
 // fetching the already-computed output, not re-executing anything).
-async function sendToWebhookWithRetry(records, webhookUrl, maxAttempts = 4) {
-  const payload = JSON.stringify({ records });
+//
+// On success, checks that the parsed response JSON has "status": "ok"
+// and logs the "rowsAppended" count. On any failure — network error,
+// non-OK HTTP status, non-JSON response, or a status other than "ok" —
+// logs the error clearly and retries once after a short pause before
+// giving up (records are never silently dropped; they're dumped to the
+// console as a last resort, and they're already on disk in the JSON/CSV
+// snapshots regardless).
+async function sendToWebhookWithRetry(records, webhookUrl, secret, maxAttempts = 2) {
+  const payload = JSON.stringify({ secret, rows: records });
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
@@ -658,8 +669,19 @@ async function sendToWebhookWithRetry(records, webhookUrl, maxAttempts = 4) {
       }
 
       const text = await response.text();
-      console.log(`  ✅ Sent ${records.length} records. Response: ${text.slice(0, 200)}`);
-      return;
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (parseErr) {
+        throw new Error(`Response wasn't valid JSON: ${text.slice(0, 200)}`);
+      }
+
+      if (data.status !== 'ok') {
+        throw new Error(`Webhook returned non-ok status: ${text.slice(0, 200)}`);
+      }
+
+      console.log(`  ✅ Sent ${records.length} records. rowsAppended: ${data.rowsAppended}`);
+      return data;
     } catch (err) {
       console.log(`  ⚠ Send attempt ${attempt}/${maxAttempts} failed: ${err.message}`);
       if (attempt < maxAttempts) {
@@ -669,10 +691,12 @@ async function sendToWebhookWithRetry(records, webhookUrl, maxAttempts = 4) {
       console.error(`❌ Could not send ${records.length} records to the webhook after ${maxAttempts} attempts.`);
       console.error(
         '  If this keeps happening, double-check your Apps Script deployment is set to ' +
-          '"Execute as: Me" and "Who has access: Anyone" (Deploy → Manage deployments → Edit).'
+          '"Execute as: Me" and "Who has access: Anyone" (Deploy → Manage deployments → Edit), ' +
+          'and that doPost(e) is checking e.parameter/JSON body "secret" against the expected value.'
       );
-      console.error('These records were not delivered. Dumping them to the console so they are not lost:');
+      console.error('These records were not delivered via webhook (they are still saved locally). Dumping them to the console so they are not lost:');
       console.error(JSON.stringify(records, null, 2));
+      return null;
     }
   }
 }
@@ -716,11 +740,16 @@ main().catch((err) => {
  *     script's auth setup) — otherwise the POST will get redirected to a
  *     login page instead of reaching your doPost(e) function.
  *   - Your Apps Script's doPost(e) needs to parse JSON.parse(e.postData.contents)
- *     and expect a shape of { records: [ {section, name, website, email,
- *     phone, country, category}, ... ] }.
- *   - Check the terminal output — failed sends are retried 4 times, then
- *     the undelivered batch is dumped to the console as JSON so nothing
- *     scraped is lost even if the webhook is down.
+ *     and expect a shape of { secret: "scrapemaster", rows: [ {section,
+ *     name, website, email, phone, country, category}, ... ] } — it
+ *     should check "secret" against the expected value and respond with
+ *     JSON like { "status": "ok", "rowsAppended": <number> } (or
+ *     { "status": "error", ... } on failure) so this script can confirm
+ *     the sheet was actually updated.
+ *   - Check the terminal output — failed sends are retried once after a
+ *     short pause, then the undelivered batch is dumped to the console as
+ *     JSON so nothing scraped is lost even if the webhook is down (it's
+ *     also already safe in ruzave-live.json / ruzave-live.csv).
  *
  * Tip: test any selector live in the DevTools Console with
  *    document.querySelectorAll('your-selector-here').length
