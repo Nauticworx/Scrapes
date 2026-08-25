@@ -71,6 +71,12 @@ const CONFIG = {
 
   maxPageLoadRetries: 3,
   pageLoadRetryDelayMs: 4000,
+
+  // Google Sheets webhook (Apps Script Web App) — receives all rows from
+  // a single scrape run in one POST request.
+  webhookUrl: 'https://script.google.com/macros/s/AKfycbyDwDbctXQxNnnWuQoKwKOG4r9wjHtgPlSJghERdxBMzg9EXJvTy15X5p5c4lHdC0L_/exec',
+  webhookSecret: 'scrapemaster',
+  webhookRetryDelayMs: 3000,
 };
 
 // ------------------------------------------------------------------
@@ -132,6 +138,66 @@ function loadExistingResults() {
   } catch (e) {
     console.log(`  ⚠ Could not parse existing ${CONFIG.jsonPath} (${e.message}). Starting fresh.`);
     return [];
+  }
+}
+
+// ------------------------------------------------------------------
+// Google Sheets webhook — batch-send all rows from this run in one POST
+// ------------------------------------------------------------------
+
+async function postRowsToWebhook(rows, attempt = 1) {
+  if (!CONFIG.webhookUrl) return;
+
+  if (!rows.length) {
+    console.log('No rows to send to the Sheets webhook — skipping.');
+    return;
+  }
+
+  const payload = {
+    secret: CONFIG.webhookSecret,
+    rows,
+  };
+
+  console.log(`Sending ${rows.length} row(s) to Sheets webhook (attempt ${attempt})...`);
+
+  try {
+    const res = await fetch(CONFIG.webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    let data;
+    const text = await res.text();
+    try {
+      data = JSON.parse(text);
+    } catch (parseErr) {
+      throw new Error(`Non-JSON response (HTTP ${res.status}): ${text.slice(0, 500)}`);
+    }
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}: ${JSON.stringify(data)}`);
+    }
+
+    if (data.status !== 'ok') {
+      throw new Error(`Webhook returned non-ok status: ${JSON.stringify(data)}`);
+    }
+
+    console.log(`✔ Webhook accepted the rows. rowsAppended: ${data.rowsAppended}`);
+    return data;
+  } catch (err) {
+    const message = `Webhook POST failed (attempt ${attempt}): ${err.message}`;
+    console.error(`❌ ${message}`);
+    logError(message);
+
+    if (attempt === 1) {
+      await randomDelay(CONFIG.webhookRetryDelayMs, CONFIG.webhookRetryDelayMs + 500);
+      return postRowsToWebhook(rows, attempt + 1);
+    }
+
+    console.error('❌ Webhook POST failed after retry. Continuing without crashing — see error log.');
+    logError('Webhook POST gave up after retry.');
+    return null;
   }
 }
 
@@ -290,6 +356,7 @@ async function main() {
 
   let duplicateCount = 0;
   let errorCount = 0;
+  const newlyScrapedThisRun = [];
 
   const cardHandles = await page.$$(CONFIG.cardSelector);
 
@@ -318,6 +385,7 @@ async function main() {
           category: data.category || '',
         };
         allResults.push(record);
+        newlyScrapedThisRun.push(record);
         writeCsvAndJson(allResults); // live save after every company
 
         console.log(`[${i + 1}/${cardHandles.length}] ${name}`);
@@ -345,7 +413,10 @@ async function main() {
   console.log(`Duplicates skipped: ${duplicateCount}`);
   console.log(`Errors: ${errorCount}\n`);
   console.log(`CSV: ${CONFIG.csvPath}`);
-  console.log(`JSON: ${CONFIG.jsonPath}`);
+  console.log(`JSON: ${CONFIG.jsonPath}\n`);
+
+  // Send this run's newly-scraped rows to the Sheets webhook in one batch.
+  await postRowsToWebhook(newlyScrapedThisRun);
 }
 
 main().catch((err) => {
