@@ -1,0 +1,21 @@
+{
+  "name": "maritime-scrapers",
+  "version": "1.0.0",
+  "description": "Four independent scrapers sharing one folder: Ruzave (scrape-ruzave.js), Maritime Directory (scrape-maritime.js), UK Chamber of Shipping (scrape-ukchamber.js), and MarineTraffic (scrape-marinetraffic.js)",
+  "private": true,
+  "scripts": {
+    "ruzave": "node scrape-ruzave.js",
+    "maritime": "node scrape-maritime.js",
+    "ukchamber": "node scrape-ukchamber.js",
+    "marinetraffic": "node scrape-marinetraffic-v2.js"
+  },
+  "dependencies": {
+    "axios": "^1.19.0",
+    "cheerio": "^1.2.0",
+    "csv-writer": "^1.6.0",
+    "exceljs": "^4.4.0",
+    "puppeteer": "^22.0.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}
