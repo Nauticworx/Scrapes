@@ -449,13 +449,25 @@ async function fetchListingDirect(browser, url) {
     if (!frame) {
       console.log("  ⚠ No forwardContainer iframe found on this listing page.");
       html = await tab.content(); // fall back to whatever the shell has, for debugging
+      await saveDebugSnapshot(tab, null, "listing-no-frame");
       return html;
     }
 
+    // Bootstrap (very first ever page) gets a long manual pause before
+    // anyone checks anything, which incidentally gives the site's own
+    // backend fetch+render plenty of time. A fully-automated page like
+    // this one moves much faster, so it may genuinely need longer than
+    // the original 20s for that same fetch+render to finish — bumped up
+    // rather than assuming it's actually empty.
     try {
-      await frame.waitForSelector(CARD_SELECTOR, { timeout: 20000 });
+      await frame.waitForSelector(CARD_SELECTOR, { timeout: 45000 });
     } catch (e) {
-      console.log(`  ⚠ "${CARD_SELECTOR}" never appeared inside the iframe within 20s (current url: ${tab.url()}).`);
+      console.log(`  ⚠ "${CARD_SELECTOR}" never appeared inside the iframe within 45s (current url: ${tab.url()}).`);
+      // Capture BOTH the tab and the frame's actual content before this
+      // tab gets closed below — a debug snapshot taken after closing
+      // (from outside this function) would just show unrelated leftover
+      // state from a different tab entirely.
+      await saveDebugSnapshot(tab, frame, "listing-card-selector-timeout");
     }
     await sleep(PAGE_SETTLE_MS);
     html = await frame.content();
@@ -596,6 +608,8 @@ async function scrapeCompanyProfileByClick(page, company) {
       console.log(`  ⚠ Navigation failed: ${e.message}`);
     }
 
+    let usedIframe = false;
+    let profileFrame = null;
     try {
       // Wait specifically for the "CONTACT INFO" section to contain a
       // table — a plain CSS wait for any mailto:/table on the page (the
@@ -609,13 +623,36 @@ async function scrapeCompanyProfileByClick(page, company) {
           const section = contactHeader.closest("section");
           return Boolean(section && section.querySelector("table"));
         },
-        { timeout: 30000 }
+        { timeout: 15000 }
       );
     } catch (e) {
-      console.log(`  ⚠ "CONTACT INFO" section never appeared within 30s (current url: ${profilePage.url()}).`);
+      // Same class of bug we found on listing pages: this profile's
+      // real content may be rendering inside the #forwardContainer
+      // iframe rather than directly on the top-level page (apparently
+      // inconsistent — some companies' profile pages do this, some
+      // don't). Try that before giving up.
+      console.log('  ⚠ "CONTACT INFO" not found directly on the page — checking for a forwardContainer iframe...');
+      profileFrame = await resolveForwardFrame(profilePage);
+      if (profileFrame) {
+        try {
+          await profileFrame.waitForFunction(
+            () => {
+              const headers = Array.from(document.querySelectorAll("section header"));
+              const contactHeader = headers.find((h) => /contact info/i.test(h.textContent || ""));
+              if (!contactHeader) return false;
+              const section = contactHeader.closest("section");
+              return Boolean(section && section.querySelector("table"));
+            },
+            { timeout: 20000 }
+          );
+          usedIframe = true;
+        } catch (e2) {
+          console.log(`  ⚠ "CONTACT INFO" section never appeared in the iframe either (current url: ${profilePage.url()}).`);
+        }
+      }
     }
     await sleep(PAGE_SETTLE_MS);
-    html = await profilePage.content();
+    html = usedIframe && profileFrame ? await profileFrame.content() : await profilePage.content();
 
     // Capture a debug snapshot if it looks empty of contact info —
     // otherwise we'd lose the chance to see what actually happened
